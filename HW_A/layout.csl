@@ -1,0 +1,219 @@
+// Color map
+//
+//  ID var                   ID var  ID var               ID var
+//   0 broadcast_rx_color    9       18                   27 reserved (memcpy)
+//   1 broadcast_tx_color    10      19                   28 reserved (memcpy)
+//   2 MEMCPYH2D_1           11      20                   29 reserved
+//   3 MEMCPYH2D_2           12      21 reserved (memcpy) 30 reserved (memcpy)
+//   4 MEMCPYD2H_1           13      22 reserved (memcpy) 31 reserved
+//   5 reduce_A_color        14      23 reserved (memcpy) 32
+//   6 reduce_B_color        15      24                   33
+//   7 reduce_C_color        16      25                   34
+//   8                       17      26                   35
+
+
+// IDs for memcpy streaming colors
+param MEMCPYH2D_DATA_1_ID: i16;
+param MEMCPYH2D_DATA_2_ID: i16;
+param MEMCPYD2H_DATA_1_ID: i16;
+
+// Colors
+const MEMCPYH2D_DATA_1: color = @get_color(MEMCPYH2D_DATA_1_ID);
+const MEMCPYH2D_DATA_2: color = @get_color(MEMCPYH2D_DATA_2_ID);
+const MEMCPYD2H_DATA_1: color = @get_color(MEMCPYD2H_DATA_1_ID);
+
+// Kernel dimensions
+param kernel_x_dim: i16;
+param kernel_y_dim: i16;
+
+// Total matrix dimensions
+param M: i16;
+param H: i16;
+param N: i16;
+
+// Colors
+// Broadcast colors: send B across columns {NORTH, SOUTH}
+const broadcast_rx_color: color = @get_color(0);
+const broadcast_tx_color: color = @get_color(1);
+
+// Reduction colors: used for the interleaved ring reduction along rows
+const reduce_A_color: color = @get_color(5);
+const reduce_B_color: color = @get_color(6);
+const reduce_C_color: color = @get_color(7);
+
+// This example uses kernel_x_dim x kernel_y_dim PEs
+const memcpy = @import_module("<memcpy/get_params>", .{
+  .width = kernel_x_dim,
+  .height = kernel_y_dim,
+  .MEMCPYH2D_1 = MEMCPYH2D_DATA_1,
+  .MEMCPYH2D_2 = MEMCPYH2D_DATA_2,
+  .MEMCPYD2H_1 = MEMCPYD2H_DATA_1
+});
+
+layout {
+  // PE coordinates are (column, row)
+  @set_rectangle(kernel_x_dim, kernel_y_dim);
+
+  // PE rectangle dimensions should evenly divide matrix dimensions
+  @comptime_assert(M % kernel_y_dim == 0);
+  @comptime_assert(H % kernel_x_dim == 0);
+  @comptime_assert(N % kernel_y_dim == 0);
+  @comptime_assert(N % kernel_x_dim == 0);
+  @comptime_assert(kernel_x_dim >= 2);
+  @comptime_assert(kernel_y_dim >= 2); 
+
+  const common_params = .{
+    .dM = M / kernel_y_dim,
+    .dN = N / kernel_x_dim,
+    .dN_y = N / kernel_y_dim,
+    .dH = H / kernel_x_dim,
+    .kernel_x_dim = kernel_x_dim,
+    .kernel_y_dim = kernel_y_dim,
+    .broadcast_tx_color = broadcast_tx_color,
+    .broadcast_rx_color = broadcast_rx_color,
+  };
+
+  // ---------------------------------------------------------------------------
+  // Initialize programs + reduction ring 
+  // ---------------------------------------------------------------------------
+  for (@range(i16, kernel_x_dim)) |pe_x| {
+    const odd: bool = (pe_x % 2 == 1);
+    const start: bool = (pe_x == 0);
+    const end: bool = (pe_x == kernel_x_dim - 1);
+    // Map indices to colors
+    const reduce_tx_color: color =
+      if (end) reduce_C_color
+      else if (odd) reduce_B_color
+      else reduce_A_color;
+    const reduce_rx_color: color =
+      if (start) reduce_C_color
+      else if (odd) reduce_A_color
+      else reduce_B_color;
+    const reduce_fly_color: color = reduce_C_color;
+
+    for (@range(i16, kernel_y_dim)) |pe_y| {
+      // Set tile code with per-PE reduce colors
+      @set_tile_code(pe_x, pe_y, "pe.csl", @concat_structs(
+        common_params,
+        .{.memcpy_params = memcpy.get_params(pe_x),
+          .reduce_tx_color = reduce_tx_color,
+          .reduce_rx_color = reduce_rx_color,
+        },
+      ));
+
+      // Set flat ring routes (only when more than 1 PE in X)
+      if (kernel_x_dim > 1) {
+        if (pe_x == 0) {
+          // First PE: tx sends EAST, rx receives from EAST
+          @set_color_config(pe_x, pe_y, reduce_tx_color, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+          });
+          @set_color_config(pe_x, pe_y, reduce_rx_color, .{
+            .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP } },
+          });
+        } else if (pe_x == kernel_x_dim - 1) {
+          // Last PE: rx receives from WEST, tx sends WEST
+          @set_color_config(pe_x, pe_y, reduce_rx_color, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+          });
+          @set_color_config(pe_x, pe_y, reduce_tx_color, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ WEST } },
+          });
+        } else {
+          // Middle PE on bottom (E→W) chain: flyover W→E, rx from EAST, tx to WEST
+          @set_color_config(pe_x, pe_y, reduce_fly_color, .{
+            .routes = .{ .rx = .{ EAST }, .tx = .{ WEST } },
+          });
+          @set_color_config(pe_x, pe_y, reduce_rx_color, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+          });
+          @set_color_config(pe_x, pe_y, reduce_tx_color, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+          });
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Broadcast color routing
+  // ---------------------------------------------------------------------------
+  // TX goes up the column, RX comes back down. The head PE does a color swap.
+  // All PEs send at the same time, but only the head PE sends data initially.
+  // When the top PE finishes, a switch sentinel is sent so the next PE can
+  // start sending, and so on until all PEs have sent their data.
+  // This is throughput-optimal, not latency-optimal.
+
+  const sender_switches = .{
+    // pos0 is the default (uses sender_routes)
+    // pos1: change rx to SOUTH
+    .pos1 = .{ .rx = SOUTH },
+    .current_switch_pos = 0,
+    .ring_mode = true, // Ring mode is not strictly necessary since we only have 2 positions (start, end).
+    .pop_mode = .{ .pop_on_advance = true }, // We need to pop the control wavelet to only switch ourself, not the whole column at once.
+  };
+
+  for (@range(i16, kernel_x_dim)) |pe_x| {
+    for (@range(i16, kernel_y_dim)) |pe_y| {
+      if (pe_y == 0) {
+        // Top row: color swap to send wavelet down the column
+        // rx from SOUTH since there is no PE above
+        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
+          .routes = .{
+            .rx = .{ RAMP },
+            .tx = .{ SOUTH, RAMP },
+            .color_swap_y = true,
+            .color_swap_x = true,
+          },
+          .switches = sender_switches,
+        });
+        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
+          .routes = .{
+            .rx = .{ RAMP },
+            .tx = .{ SOUTH },
+            .color_swap_y = true,
+            .color_swap_x = true,
+          },
+          .switches = sender_switches,
+        });
+      } else if (pe_y == kernel_y_dim - 1) {
+        // Bottom row: receive from north, don't forward further
+        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
+          .routes = .{
+            .rx = .{ NORTH },
+            .tx = .{ RAMP },
+          },
+        });
+        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
+          .routes = .{
+            .rx = .{ RAMP },
+            .tx = .{ NORTH },
+          },
+        });
+      } else {
+        // Middle rows: send data up, receive from south on same color
+        // TX direction comes back down from the head PE
+        @set_color_config(pe_x, pe_y, broadcast_tx_color, .{
+          .routes = .{
+            .rx = .{ NORTH },
+            .tx = .{ RAMP, SOUTH },
+          },
+        });
+        @set_color_config(pe_x, pe_y, broadcast_rx_color, .{
+          .routes = .{
+            .rx = .{ RAMP },
+            .tx = .{ NORTH },
+          },
+          .switches = sender_switches,
+        });
+      }
+    }
+  }
+
+  // Export symbol names
+  @export_name("A", [*]f32, true);
+  @export_name("B", [*]f32, true);
+  @export_name("C", [*]f32, true);
+  @export_name("broadcast_pe", fn () void);
+  @export_name("compute", fn () void);
+}

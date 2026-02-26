@@ -1,0 +1,68 @@
+// Row reduction test — layout file
+//
+// Color map:
+//  ID var                   ID var   ID var               ID var
+//   0                        9       18                   27 reserved (memcpy)
+//   1                       10       19                   28 reserved (memcpy)
+//   2 MEMCPYH2D_1           11       20                   29 reserved
+//   3                       12       21 reserved (memcpy)  30 reserved (memcpy)
+//   4 MEMCPYD2H_1           13       22 reserved (memcpy)  31 reserved
+//   5 reduce_color_A        14       23 reserved (memcpy)  32
+//   6 reduce_color_B        15       24                    33
+//   7 reduce_color_C        16       25                    34
+//   8                       17       26                    35
+
+param MEMCPYH2D_DATA_1_ID: i16;
+param MEMCPYD2H_DATA_1_ID: i16;
+param kernel_x_dim: i16;
+param kernel_y_dim: i16;
+param extent: i16;
+param results_per_pe: i16;
+
+const MEMCPYH2D_DATA_1: color = @get_color(MEMCPYH2D_DATA_1_ID);
+const MEMCPYD2H_DATA_1: color = @get_color(MEMCPYD2H_DATA_1_ID);
+
+// Memcpy layout params
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width = kernel_x_dim,
+    .height = kernel_y_dim,
+    .MEMCPYH2D_1 = MEMCPYH2D_DATA_1,
+    .MEMCPYD2H_1 = MEMCPYD2H_DATA_1,
+});
+
+// Reduce layout helper
+const red = @import_module("layout.csl", .{
+    .reduce_color_A = @get_color(5),
+    .reduce_color_B = @get_color(6),
+    .reduce_color_C = @get_color(7),
+    .kernel_x_dim = kernel_x_dim,
+    .output_queue_id = 2,
+    .input_queue_id  = 1,
+});
+
+layout {
+    @set_rectangle(kernel_x_dim, kernel_y_dim);
+
+    @comptime_assert(kernel_x_dim >= 2);
+    @comptime_assert(kernel_y_dim >= 1);
+    @comptime_assert(extent >= 1);
+    @comptime_assert(results_per_pe >= 1);
+
+    for (@range(i16, kernel_x_dim)) |pe_x| {
+        for (@range(i16, kernel_y_dim)) |pe_y| {
+            @set_tile_code(pe_x, pe_y, "test_pe.csl", .{
+                .memcpy_params = memcpy.get_params(pe_x),
+                .reduce_params = red.get_params(pe_x),
+                .kernel_x_dim = kernel_x_dim,
+                .extent = extent,
+                .results_per_pe = results_per_pe,
+            });
+
+            red.set_color_config(pe_x, pe_y);
+        }
+    }
+
+    @export_name("send_buf", [*]f32, true);
+    @export_name("result", [*]f32, true);
+    @export_name("f_reduce", fn() void);
+}

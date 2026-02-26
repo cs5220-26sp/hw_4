@@ -1,0 +1,119 @@
+// Parameters from layout
+param memcpy_params: comptime_struct;
+param dM: i16;
+param dN: i16;
+param dN_y: i16;
+param dH: i16;
+param kernel_x_dim: i16;
+param kernel_y_dim: i16;
+param broadcast_params: comptime_struct;
+param reduce_params: comptime_struct;
+
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_mod = @import_module("<layout>");
+const tile_config = @import_module("<tile_config>");
+const prt = @import_module("<simprint>");
+const ops = @import_module("<dsd_ops>");
+
+const bcast = @import_module("broadcast/pe.csl", .{
+    .broadcast_params = broadcast_params,
+    .f_activate = on_broadcast_wavelet,
+    .f_done = on_broadcast_done,
+});
+
+// DSD for writing to columns of C (column-major access)
+var C_col_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dM} -> C[i * dN] });
+
+// Result DSD provider for reduce module: writes to successive C columns
+var reduce_local_col: i16 = 0;
+fn get_reduce_result_dsd() mem1d_dsd {
+    const dsd = @increment_dsd_offset(C_col_dsd, reduce_local_col, f32);
+    reduce_local_col += 1;
+    if (reduce_local_col == dN) {
+        reduce_local_col = 0;
+    }
+    return dsd;
+}
+
+fn on_all_done() void { sys_mod.unblock_cmd_stream(); }
+
+const red = @import_module("reduce/pe.csl", .{
+    .reduce_params = reduce_params,
+    .extent = dM,
+    .results_per_pe = dN,
+    .f_get_result_dsd = get_reduce_result_dsd,
+    .f_done = on_all_done,
+});
+
+var A_col_local_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dM} -> A[i] });
+
+// Storage for matrices
+var A: [dM * dH]f32 = @zeros([dM * dH]f32);
+var B: [dH * dN_y]f32 = @zeros([dH * dN_y]f32);
+var C: [dM * dN]f32 = @zeros([dM * dN]f32);
+
+var red_in: [dM]f32 = @zeros([dM]f32);
+const red_in_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dM} -> red_in[i] });
+
+var ptr_A: [*]f32 = &A;
+var ptr_B: [*]f32 = &B;
+var ptr_C: [*]f32 = &C;
+
+// Helper to print PE coordinates
+fn simprint_pe_coords() void {
+   // Get absolute fabric coordinates
+   const abs_x: u16 = tile_config.get_fabric_coord(tile_config.fabric_coord.X);
+   const abs_y: u16 = tile_config.get_fabric_coord(tile_config.fabric_coord.Y);
+   prt.fmt_no_nl("Loc({d}, {d}) P{d}.{d}: ", .{layout_mod.get_x_coord(), layout_mod.get_y_coord(), abs_x, abs_y});
+}
+
+// Broadcast callback: invoked for each received wavelet
+var current_row: i16 = 0;
+fn on_broadcast_wavelet(in_data: f32) void {
+  simprint_pe_coords();
+  prt.print_string("recv_broadcast: ");
+  prt.print_f32(in_data);
+  prt.fmt_no_nl(" current row: {d}", .{@as(u16, current_row)});
+  if (current_row == 0) {
+    // First row of the broadcast: zero the reduction buffer
+    @mov32(red_in_dsd, 0);
+  }
+
+  var loc_A_dsd = @increment_dsd_offset(A_col_local_dsd, dM * current_row, f32);
+  current_row += 1;
+
+  // Perform SAXPY: red_in = red_in + A_col * in_data
+  ops.fmac(f32, f32, red_in_dsd, red_in_dsd, loc_A_dsd, in_data, .{});
+  if (current_row == dH) {
+    // Column complete - trigger reduction across X dimension
+    current_row = 0;
+    red.reduce(red_in_dsd);
+  }
+  prt.print_string("\n");
+}
+
+// Broadcast completion callback (completion tracked by reduce module)
+fn on_broadcast_done() void {}
+
+// Broadcast a column of B using the broadcast library
+fn broadcast_pe() void {
+  red.start();
+  simprint_pe_coords();
+  prt.print_string("broadcast_pe: starting send\n");
+
+  const send_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dH * dN_y} -> B[i] });
+  bcast.broadcast_start(send_dsd);
+}
+
+comptime {
+  @comptime_assert(@is_arch("wse2"));
+
+  bcast.init();
+  red.init();
+
+  @export_symbol(ptr_A, "A");
+  @export_symbol(ptr_B, "B");
+  @export_symbol(ptr_C, "C");
+  @export_symbol(broadcast_pe);
+}

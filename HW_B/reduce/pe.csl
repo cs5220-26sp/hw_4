@@ -1,0 +1,134 @@
+// Row reduction — PE module
+//
+// Interleaved ring reduction across PEs in the X dimension.
+// Each call to reduce(data_dsd) submits one vector for summation
+// across all PEs in the row.  Results rotate: PE x=0 receives the
+// first `results_per_pe` results, PE x=1 gets the next batch, etc.
+//
+// Usage in PE file:
+//
+//   param reduce_params: comptime_struct;
+//
+//   fn get_result_dsd() mem1d_dsd { ... }
+//   fn on_done() void { ... }
+//
+//   const red = @import_module("reduce/pe.csl", .{
+//       .reduce_params   = reduce_params,
+//       .extent          = extent,        // vector length per reduction
+//       .results_per_pe  = results_per_pe,
+//       .f_get_result_dsd = get_result_dsd, // called in FSUM to get dest DSD
+//       .f_done          = on_done,         // called when all reductions complete
+//   });
+//
+//   comptime { red.init(); }
+//
+//   fn start() void {
+//       red.start();        // initialize state machine
+//       // ... then call red.reduce(dsd) for each round
+//   }
+
+param reduce_params: comptime_struct;
+param extent: i16;
+param results_per_pe: i16;
+param f_get_result_dsd: fn() mem1d_dsd;
+param f_done: fn() void;
+
+// Extract fields from the layout-generated params struct
+const reduce_tx_color = reduce_params.reduce_tx_color;
+const reduce_rx_color = reduce_params.reduce_rx_color;
+const kernel_x_dim    = reduce_params.kernel_x_dim;
+const output_queue_id = reduce_params.output_queue_id;
+const input_queue_id  = reduce_params.input_queue_id;
+
+const layout_mod = @import_module("<layout>");
+
+// Queue objects
+const oq: output_queue = @get_output_queue(output_queue_id);
+const iq: input_queue  = @get_input_queue(input_queue_id);
+
+// Fabric DSDs
+const fab_out_dsd = @get_dsd(fabout_dsd, .{
+    .extent = extent,
+    .fabric_color = reduce_tx_color,
+    .output_queue = oq,
+});
+
+const fab_in_dsd = @get_dsd(fabin_dsd, .{
+    .extent = extent,
+    .fabric_color = reduce_rx_color,
+    .input_queue = iq,
+});
+
+// These are the main states of the reduction state machine.
+const ISUM: i16 = 0;  // Initiator: send local data, no receive
+const PSUM: i16 = 1;  // Partial:   receive, add local, forward
+const FSUM: i16 = 2;  // Final:     receive, add local, write result
+
+var reduce_state: i16 = 0;
+var col_until_state_change: i16 = 0;
+var local_col: i16 = 0;
+var reduce_count: u32 = 0;
+
+/// Initialize the state machine.  Call before the first reduce().
+fn start() void {
+    local_col = 0;
+    reduce_count = 0;
+    const pos: i16 = @as(i16, layout_mod.get_x_coord());
+    if (pos == 0) {
+        reduce_state = FSUM;
+    } else if (pos == 1) {
+        col_until_state_change = results_per_pe;
+        reduce_state = ISUM;
+    } else {
+        col_until_state_change = results_per_pe * (pos - 1);
+        reduce_state = PSUM;
+    }
+}
+
+/// Submit one vector for reduction.
+/// data_dsd: mem1d_dsd of `extent` f32 elements (this PE's contribution).
+fn reduce(data_dsd: mem1d_dsd) void {
+    reduce_count += 1;
+
+    if (reduce_state == ISUM) {
+        // Initiator: send local data to fabric
+        @fmovs(fab_out_dsd, data_dsd, .{});
+        col_until_state_change -= 1;
+        if (col_until_state_change == 0) {
+            reduce_state = FSUM;
+        }
+    } else if (reduce_state == PSUM) {
+        // Partial: receive from fabric, add local, forward
+        @fadds(fab_out_dsd, data_dsd, fab_in_dsd, .{});
+        col_until_state_change -= 1;
+        if (col_until_state_change == 0) {
+            col_until_state_change = results_per_pe;
+            reduce_state = ISUM;
+        }
+    } else if (reduce_state == FSUM) {
+        // Final: receive from fabric, add local, write result
+        const result_dsd = f_get_result_dsd();
+        @fadds(result_dsd, data_dsd, fab_in_dsd, .{});
+        local_col += 1;
+        if (local_col == results_per_pe) {
+            local_col = 0;
+            if (kernel_x_dim > 2) {
+                reduce_state = PSUM;
+                col_until_state_change = results_per_pe * @as(i16, kernel_x_dim - 2);
+            } else {
+                col_until_state_change = results_per_pe;
+                reduce_state = ISUM;
+            }
+        }
+    }
+
+    if (reduce_count == @as(u32, results_per_pe) * @as(u32, kernel_x_dim)) {
+        f_done();
+    }
+}
+
+/// Bind queues.  Call from the PE's comptime block.
+fn init() void {
+    @initialize_queue(oq, .{});
+    @initialize_queue(iq, .{ .color = reduce_rx_color });
+}

@@ -1,0 +1,108 @@
+// Row reduction — layout helper
+//
+// Interleaved ring reduction across PEs in the X dimension.
+// Uses 3 colors (A, B, C) to avoid routing conflicts on middle PEs.
+// Data flows EAST from initiator, accumulates partial sums, and the
+// final result lands on PE x=0 first, then rotates to x=1, etc.
+//
+// Usage in layout file:
+//
+//   const red = @import_module("reduce/layout.csl", .{
+//       .reduce_color_A = @get_color(5),
+//       .reduce_color_B = @get_color(6),
+//       .reduce_color_C = @get_color(7),
+//       .kernel_x_dim = kernel_x_dim,
+//       .output_queue_id = 2,
+//       .input_queue_id  = 1,
+//   });
+//
+//   layout {
+//       for (...) |pe_x| {
+//           for (...) |pe_y| {
+//               @set_tile_code(pe_x, pe_y, "pe.csl", .{
+//                   .reduce_params = red.get_params(pe_x),
+//                   ...
+//               });
+//               red.set_color_config(pe_x, pe_y);
+//           }
+//       }
+//   }
+
+param reduce_color_A: color;
+param reduce_color_B: color;
+param reduce_color_C: color;
+param kernel_x_dim: i16;
+param output_queue_id: u16;
+param input_queue_id: u16;
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Configure colors and routes for a PE at (pe_x, pe_y).
+/// Call from within the layout {} block for every PE (after @set_tile_code).
+fn set_color_config(pe_x: i16, pe_y: i16) void {
+    const odd: bool = (pe_x % 2 == 1);
+    const start: bool = (pe_x == 0);
+    const end: bool = (pe_x == kernel_x_dim - 1);
+
+    const tx_color: color =
+        if (end) reduce_color_C
+        else if (odd) reduce_color_B
+        else reduce_color_A;
+    const rx_color: color =
+        if (start) reduce_color_C
+        else if (odd) reduce_color_A
+        else reduce_color_B;
+
+    if (start) {
+        // First PE: tx sends EAST, rx receives from EAST
+        @set_color_config(pe_x, pe_y, tx_color, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+        });
+        @set_color_config(pe_x, pe_y, rx_color, .{
+            .routes = .{ .rx = .{ EAST }, .tx = .{ RAMP } },
+        });
+    } else if (end) {
+        // Last PE: rx from WEST, tx sends WEST
+        @set_color_config(pe_x, pe_y, rx_color, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+        });
+        @set_color_config(pe_x, pe_y, tx_color, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ WEST } },
+        });
+    } else {
+        // Middle PE: flyover for color C, rx from WEST, tx to EAST
+        @set_color_config(pe_x, pe_y, reduce_color_C, .{
+            .routes = .{ .rx = .{ EAST }, .tx = .{ WEST } },
+        });
+        @set_color_config(pe_x, pe_y, rx_color, .{
+            .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP } },
+        });
+        @set_color_config(pe_x, pe_y, tx_color, .{
+            .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST } },
+        });
+    }
+}
+
+/// Generate the comptime_struct to pass through @set_tile_code as
+/// `reduce_params`.  Note: per-column (pe_x determines tx/rx colors).
+fn get_params(pe_x: i16) comptime_struct {
+    const odd: bool = (pe_x % 2 == 1);
+    const start: bool = (pe_x == 0);
+    const end: bool = (pe_x == kernel_x_dim - 1);
+
+    return .{
+        .reduce_tx_color =
+            if (end) reduce_color_C
+            else if (odd) reduce_color_B
+            else reduce_color_A,
+        .reduce_rx_color =
+            if (start) reduce_color_C
+            else if (odd) reduce_color_A
+            else reduce_color_B,
+        .kernel_x_dim = kernel_x_dim,
+        .output_queue_id = output_queue_id,
+        .input_queue_id = input_queue_id,
+    };
+}

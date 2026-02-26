@@ -1,0 +1,251 @@
+// Parameters from layout
+param memcpy_params: comptime_struct;
+param dM: i16;
+param dN: i16;
+param dN_y: i16;
+param dH: i16;
+param kernel_x_dim: i16;
+param kernel_y_dim: i16;
+param broadcast_tx_color: color;
+param broadcast_rx_color: color;
+param reduce_tx_color: color;
+param reduce_rx_color: color;
+
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const ctrl = @import_module("<control>");
+const layout_mod = @import_module("<layout>");
+const tile_config = @import_module("<tile_config>");
+const prt = @import_module("<simprint>");
+const ops = @import_module("<dsd_ops>");
+
+// Output queue for broadcast_rx_color
+const broadcast_oq: output_queue = @get_output_queue(2);
+
+// Reduce ring queues
+const reduce_oq: output_queue = @get_output_queue(3);
+const reduce_iq: input_queue = @get_input_queue(2);
+
+// Task IDs
+const send_done_task_id: local_task_id = @get_local_task_id(10);
+
+// DSD for sending control wavelet to advance switch position
+const switch_adv_dsd = @get_dsd(fabout_dsd, .{
+  .extent = 1,
+  .fabric_color = broadcast_rx_color,
+  .control = true,
+  .output_queue = broadcast_oq,
+});
+
+// DSD for sending broadcast data to fabric
+const send_broadcast_fab_dsd = @get_dsd(fabout_dsd, .{
+  .extent = dH * dN_y,
+  .fabric_color = broadcast_rx_color,
+  .output_queue = broadcast_oq,
+});
+
+// DSD for reading B chunk from memory, configured for row-major access
+// B is row-major (dH x dN_y)
+var B_local_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dH * dN_y} -> B[i] });
+
+var A_col_local_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dM} -> A[i] });
+
+// Buffer for control wavelet payload
+var switch_adv_buf = [1]u32{ ctrl.encode_single_payload(ctrl.opcode.SWITCH_ADV, true, {}, 0) };
+const switch_adv_buf_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> switch_adv_buf[i] });
+
+// Storage for matrices
+var A: [dM * dH]f32 = @zeros([dM * dH]f32);
+var B: [dH * dN_y]f32 = @zeros([dH * dN_y]f32);
+var C: [dM * dN]f32 = @zeros([dM * dN]f32);
+
+var red_in: [dM]f32 = @zeros([dM]f32);
+const red_in_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dM} -> red_in[i] });
+
+// Fabric DSDs for the reduction ring
+const reduce_fab_out_dsd = @get_dsd(fabout_dsd, .{
+  .extent = dM,
+  .fabric_color = reduce_tx_color,
+  .output_queue = reduce_oq,
+});
+
+const reduce_fab_in_dsd = @get_dsd(fabin_dsd, .{
+  .extent = dM,
+  .fabric_color = reduce_rx_color,
+  .input_queue = reduce_iq,
+});
+
+// DSD for writing to columns of C (column-major access)
+var C_col_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dM} -> C[i * dN] });
+
+var ptr_A: [*]f32 = &A;
+var ptr_B: [*]f32 = &B;
+var ptr_C: [*]f32 = &C;
+
+// Counter to track total reduce() calls for completion synchronization
+var reduce_count: u32 = 0;
+
+// Helper to print PE coordinates
+fn simprint_pe_coords() void {
+   // Get absolute fabric coordinates
+   const abs_x: u16 = tile_config.get_fabric_coord(tile_config.fabric_coord.X);
+   const abs_y: u16 = tile_config.get_fabric_coord(tile_config.fabric_coord.Y);
+   prt.fmt_no_nl("Loc({d}, {d}) P{d}.{d}: ", .{layout_mod.get_x_coord(), layout_mod.get_y_coord(), abs_x, abs_y});
+}
+
+// Data task triggered by incoming broadcast wavelets
+var current_row: i16 = 0;
+task recv_broadcast_task(in_data: f32) void {
+  simprint_pe_coords();
+  prt.print_string("recv_broadcast: ");
+  prt.print_f32(in_data);
+  prt.fmt_no_nl(" current row: {d}", .{@as(u16, current_row)});
+  if (current_row == 0) {
+    // First row of the broadcast: zero the reduction buffer
+    @mov32(red_in_dsd, 0);
+  }
+
+  var loc_A_dsd = @increment_dsd_offset(A_col_local_dsd, dM * current_row, f32);
+  current_row += 1;
+
+  // Perform SAXPY: red_in = red_in + A_col * in_data
+  ops.fmac(f32, f32, red_in_dsd, red_in_dsd, loc_A_dsd, in_data, .{});
+  if (current_row == dH) {
+    // Column complete - trigger reduction across X dimension
+    current_row = 0;
+    reduce();
+  }
+  prt.print_string("\n");
+}
+
+// Local task triggered when broadcast send completes
+// Sends the sentinel wavelet to advance the fabric switch
+task send_done_task() void {
+  simprint_pe_coords();
+  prt.print_string("send_done: sending switch advance\n");
+
+  // Send control wavelet to advance to the next switch position
+  @mov32(switch_adv_dsd, switch_adv_buf_dsd, .{ .async = true });
+}
+
+// Reduce task: accumulate partial sums across X dimension via the reduction ring.
+// Last PE (x == kernel_x_dim-1): initiator, sends red_in to fabric.
+// Middle PEs: receive from fabric, add local red_in, forward to fabric.
+// First PE (x == 0): terminator, receive from fabric, add local red_in, write to C.
+// Track which output column we're reducing
+var col_until_state_change: i16 = 0;
+var local_col: i16 = 0;
+
+// Reduce states as integer constants
+const ISUM: i16 = 0; // Initiator: send local data, no receive
+const PSUM: i16 = 1; // Partial: receive, add local, forward
+const FSUM: i16 = 2; // Final: receive, add local, write to C
+
+var reduce_state: i16 = 0;
+
+fn initialize_reduce() void {
+  local_col = 0;
+  const pos: i16 = @as(i16, layout_mod.get_x_coord());
+  simprint_pe_coords();
+  prt.fmt_no_nl("initialize_reduce: position in reduction chain: {d}\n", .{@as(u16, pos)});
+  if (pos == 0) {
+    reduce_state = FSUM;
+  } else if (pos == 1) {
+    col_until_state_change = dN;
+    reduce_state = ISUM;
+  } else {
+    col_until_state_change = dN * (pos - 1);
+    reduce_state = PSUM;
+  }
+}
+
+// Reduction direction --> 
+// P1: FSUM ISUM PSUM PSUM
+// P2: PSUM FSUM ISUM PSUM
+// P3: PSUM PSUM FSUM ISUM
+fn reduce() void {
+  reduce_count += 1;
+  simprint_pe_coords();
+  prt.print_string("reduce: starting reduction -> ");
+  if (reduce_state == ISUM) {
+    prt.print_string(" state: ISUM\n");
+    // Initiator: send local red_in to fabric
+    @fmovs(reduce_fab_out_dsd, red_in_dsd, .{});
+    col_until_state_change -= 1;
+    if (col_until_state_change == 0) {
+      reduce_state = FSUM;
+    }
+  } else if (reduce_state == PSUM) {
+    prt.print_string(" state: PSUM\n");
+    // Middle PEs: receive from fabric, add local red_in, forward to fabric
+    @fadds(reduce_fab_out_dsd, red_in_dsd, reduce_fab_in_dsd, .{});
+    col_until_state_change -= 1;
+    if (col_until_state_change == 0) {
+      col_until_state_change = dN;
+      reduce_state = ISUM;
+    }
+  } else if (reduce_state == FSUM) {
+    prt.print_string(" state: FSUM\n");
+    // Terminator: receive from fabric, add local red_in, write to C
+    var loc_C_dsd = @increment_dsd_offset(C_col_dsd, local_col, f32);
+    @fadds(loc_C_dsd, red_in_dsd, reduce_fab_in_dsd, .{});
+
+    simprint_pe_coords();
+    prt.fmt_no_nl("Values: C[0]={f}\\n", .{C[0]});
+
+    local_col += 1;
+    if (local_col == dN) {
+      local_col = 0;
+      if (kernel_x_dim > 2) {
+        // There are middle PEs: go through PSUM before next ISUM
+        reduce_state = PSUM;
+        col_until_state_change = dN * @as(i16, kernel_x_dim - 2);
+      } else {
+        // Only 2 PEs: no middle PEs, go directly to ISUM
+        col_until_state_change = dN;
+        reduce_state = ISUM;
+      }
+    }
+  }
+
+  simprint_pe_coords();
+  prt.print_string("reduce: end reduction ==========================\n");
+
+  // Check if all broadcast columns have been processed
+  // Total reduce calls expected = kernel_y_dim * dN_y (one per global B-column)
+  if (reduce_count == @as(u32, kernel_y_dim) * @as(u32, dN_y)) {
+    sys_mod.unblock_cmd_stream();
+  }
+}
+
+// Broadcast a column of B using async UT, activates send_done_task on completion
+fn broadcast_pe() void {
+  initialize_reduce();
+  simprint_pe_coords();
+  prt.print_string("broadcast_pe: starting send\n");
+
+  // Send data asynchronously, activate send_done_task when complete
+  @mov32(send_broadcast_fab_dsd, B_local_dsd, .{ .async = true, .activate = send_done_task_id });
+}
+
+comptime {
+  @comptime_assert(@is_arch("wse2"));
+
+  const broadcast_iq = @get_input_queue(1);
+  const recv_broadcast_task_id: data_task_id = @get_data_task_id(broadcast_tx_color);
+  @initialize_queue(broadcast_iq, .{ .color = broadcast_tx_color });
+  // Bind the data task to receive broadcast wavelets
+  @bind_data_task(recv_broadcast_task, recv_broadcast_task_id);
+
+  // Bind the local task for send completion
+  @bind_local_task(send_done_task, send_done_task_id);
+
+  // Initialize reduce ring queues
+  @initialize_queue(reduce_oq, .{  });
+  @initialize_queue(reduce_iq, .{ .color = reduce_rx_color });
+
+  @export_symbol(ptr_A, "A");
+  @export_symbol(ptr_B, "B");
+  @export_symbol(ptr_C, "C");
+  @export_symbol(broadcast_pe);
+}
