@@ -102,14 +102,13 @@ var ptr_C: [*]f32 = &C;
 //
 // You need to implement:
 //   - DSDs for fabric I/O (broadcast send/receive, reduce send/receive)
-//   - DSDs for memory access (reading A columns, B data, writing C columns)
+//   - DSDs for memory access (reading A & B, writing C)
 //   - A data task that fires on each incoming broadcast wavelet
-//   - A broadcast send function that sends local B data to the column
-//   - A ring reduction that accumulates partial sums across X-PEs
+//   - A broadcast send function that sends local B data to the column, 
+//     do this purely with DSDs
 //   - Switch advance logic so each PE in the column takes turns broadcasting
-//   - Completion detection (unblock_cmd_stream when all reductions are done)
-//   - TSC end timestamp: when done, call timestamp.get_timestamp(&tscEndBuffer)
-//     and copy into time_buf_u16[3..5] before unblocking
+//   - A ring reduction that accumulates partial sums across X-PEs
+//   - Completion detection (terminate_kernel when all reductions are done).
 //
 // Useful builtins/modules:
 //   @get_dsd(fabout_dsd, ...), @get_dsd(fabin_dsd, ...), @get_dsd(mem1d_dsd, ...)

@@ -94,38 +94,13 @@ def reconstruct_d2h(data, rows, cols, global_transpose, memory_transpose):
 
 
 # =============================================================================
-# TODO: Set the global and memory layout booleans for each matrix.
-#
-# You are computing C = A * B where A ∈ R^{M×H}, B ∈ R^{H×N}, C ∈ R^{M×N}.
-#
-# The PE grid has kernel_x_dim columns and kernel_y_dim rows.
-# The hidden dimension H must be split along X so that partial products
-# can be reduced horizontally across the PE row.
-#
-# Global layout controls how matrix blocks map to PEs:
-#   False = "natural": matrix-rows along Y-PEs, matrix-cols along X-PEs
-#   True  = "transposed": matrix-rows along X-PEs, matrix-cols along Y-PEs
-#
-# Memory layout controls how each local block is stored:
-#   False = row-major in natural orientation
-#   True  = store the transpose (row-major of the transposed block)
-#
-# Hint: think about which dimension needs to be contiguous in memory for
-# efficient DSD access (broadcast columns of B, SAXPY with columns of A,
-# write columns into C).
+# Student configuration — imported from config.py
 # =============================================================================
-
-# --- Matrix A (M x H) ---
-A_GLOBAL_TRANSPOSE = ???  # TODO
-A_MEMORY_TRANSPOSE = ???  # TODO
-
-# --- Matrix B (H x N) ---
-B_GLOBAL_TRANSPOSE = ???  # TODO
-B_MEMORY_TRANSPOSE = ???  # TODO
-
-# --- Matrix C (M x N) ---
-C_GLOBAL_TRANSPOSE = ???  # TODO
-C_MEMORY_TRANSPOSE = ???  # TODO
+from config import (
+  A_GLOBAL_TRANSPOSE, A_MEMORY_TRANSPOSE,
+  B_GLOBAL_TRANSPOSE, B_MEMORY_TRANSPOSE,
+  C_GLOBAL_TRANSPOSE, C_MEMORY_TRANSPOSE,
+)
 
 
 # =============================================================================
